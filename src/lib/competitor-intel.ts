@@ -1,5 +1,5 @@
 import { ApifyClient } from "apify-client";
-import OpenAI from "openai";
+import { askClaude } from "./bedrock";
 
 const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
@@ -24,43 +24,27 @@ export interface CompetitorIntelligenceResult {
 
 // Dynamically pick fintech competitors based on BOTH role type AND seniority level
 async function getCompetitors(role: string): Promise<{ competitors: string[]; levels: Record<string, string> }> {
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content: `You are a fintech talent market expert. Given a job role at Acme (a Series C fintech startup in payments/financial infrastructure), identify the 6 most relevant competitor companies AND the equivalent level at each company that would realistically be competing for this exact candidate.
+  const raw = await askClaude(
+    `Role: ${role}`,
+    `You are a fintech talent market expert. Given a job role at Acme (a Series C fintech startup in payments/financial infrastructure), identify the 6 most relevant competitor companies AND the equivalent level at each company.
 
 Rules:
-- Only fintech companies (payments, banking, crypto, expense mgmt, lending, compliance tech, etc.)
-- Match FUNCTION (engineering vs product vs compliance vs sales etc.), SENIORITY (IC vs manager vs director vs VP), and infer the equivalent level at each competitor
-- Level mapping examples:
-  - "Senior Engineer" → Stripe L4, Coinbase E4, PayPal P5, Plaid Senior
-  - "Staff Engineer" → Stripe L5, Coinbase E5, PayPal P6, Plaid Staff
-  - "Principal Engineer" → Stripe L6, Coinbase E6, PayPal P7
-  - "Senior PM" → Stripe PM3, Coinbase PM4, Brex Senior PM
-  - "Director of Engineering" → Stripe L7, Coinbase Director, PayPal Director
-  - "VP Engineering" → Stripe L8/VP, Coinbase VP, PayPal VP
-- For senior/director+ roles: include larger fintechs (Stripe, PayPal, Coinbase)
-- For IC/mid-level: weight toward same-stage fintechs (Brex, Ramp, Plaid, Chime, Marqeta)
-- For specialized roles (compliance, fraud, risk): include domain-specific fintechs
-- For crypto/web3: include Coinbase, Robinhood, Kraken, Gemini
+- Only fintech companies (payments, banking, crypto, expense mgmt, lending, compliance tech)
+- Match FUNCTION and SENIORITY, infer equivalent level at each competitor
+- Level examples: "Senior Engineer" → Stripe L4, Coinbase E4; "Staff Engineer" → Stripe L5, Coinbase E5; "Director" → Stripe L7, Coinbase Director
+- Senior/director+: include larger fintechs (Stripe, PayPal, Coinbase)
+- IC/mid-level: weight toward same-stage (Brex, Ramp, Plaid, Chime, Marqeta)
 - Never include non-fintech companies
 
 Return JSON only: {
   "competitors": ["Company1", "Company2", "Company3", "Company4", "Company5", "Company6"],
   "levels": { "Company1": "L5", "Company2": "E5", "Company3": "Senior" },
-  "reasoning": "one line why these companies and levels"
+  "reasoning": "one line why"
 }`,
-      },
-      { role: "user", content: `Role: ${role}` },
-    ],
-    response_format: { type: "json_object" },
-  });
+    { fast: true, jsonMode: true }
+  );
 
-  const result = JSON.parse(response.choices[0].message.content!);
+  const result = JSON.parse(raw);
   console.log(`[competitor] AI-picked for "${role}": ${result.competitors.join(", ")} — ${result.reasoning}`);
   // Attach levels to competitor names so the rest of the pipeline can use them
   return { competitors: result.competitors as string[], levels: result.levels as Record<string, string> };
@@ -153,82 +137,41 @@ export async function collectCompetitorIntelligence(
     google.length > 0 ? `Google Search · ${google.length} results (Apify)` : null,
     linkedin.length > 0 ? `LinkedIn · ${linkedin.length} profiles (Apify)` : null,
     github.length > 0 ? `GitHub · ${github.length} signals` : null,
-    "GPT-4o synthesis",
+    "Claude (AWS Bedrock) synthesis",
   ].filter(Boolean) as string[];
 
   console.log(`[competitor] sources: ${sourcesUsed.join(", ")}`);
 
-  // Synthesize everything with OpenAI
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o",
-    messages: [
-      {
-        role: "system",
-        content: `You are a competitive compensation intelligence analyst for Acme — a Series C fintech startup competing for talent against Stripe, Plaid, Brex, Ramp, Chime, Coinbase, and similar companies.
+  // Synthesize with Claude on AWS Bedrock
+  const aiRaw = await askClaude(
+    JSON.stringify({ role, competitors, equivalentLevels: levels, googleSearchResults: google.slice(0, 8), linkedinData: linkedin.slice(0, 5), githubSignals: github }),
+    `You are a competitive compensation intelligence analyst for Acme — a Series C fintech startup competing for talent against Stripe, Plaid, Brex, Ramp, Chime, Coinbase, and similar companies.
 
 Your job: give the Acme recruiter intelligence they CANNOT get from the interview — only from the public market.
 
-Context about Acme:
-- Series C fintech, ~$500M raised, 300–600 employees
-- Offers competitive base + meaningful equity (Series C = real upside potential)
-- Smaller than Stripe/PayPal but more equity leverage and faster career growth
-- Strong engineering culture, remote-friendly
+Acme context: Series C fintech, ~$500M raised, 300–600 employees, competitive base + meaningful equity, smaller than Stripe/PayPal but more equity leverage and faster career growth.
 
 Use scraped data where available. Fill gaps with your knowledge of fintech compensation in 2024-2025.
 
 Return JSON:
 {
-  "competitors": [
-    {
-      "company": "Stripe",
-      "equivalentLevel": "L5",
-      "salaryRange": { "min": 180000, "max": 280000, "currency": "USD" },
-      "rating": 4.4,
-      "reviewHighlights": ["top-tier eng culture", "high bar, slow promotions"],
-      "topPerks": ["RSU refresh", "remote-friendly", "strong brand"]
-    }
-  ],
-  "salaryBenchmarks": {
-    "low": 150000,
-    "median": 200000,
-    "high": 300000,
-    "currency": "USD",
-    "source": "Glassdoor / levels.fyi fintech 2025 estimates"
-  },
-  "jobPostings": [
-    { "company": "Stripe", "title": "${role}", "location": "Remote / SF" }
-  ],
-  "glassdoorData": [
-    { "company": "Stripe", "rating": 4.4, "reviewSnippets": ["Great engineers", "Intense pace"] }
-  ],
+  "competitors": [{ "company": "Stripe", "equivalentLevel": "L5", "salaryRange": { "min": 180000, "max": 280000, "currency": "USD" }, "rating": 4.4, "reviewHighlights": ["..."], "topPerks": ["..."] }],
+  "salaryBenchmarks": { "low": 150000, "median": 200000, "high": 300000, "currency": "USD", "source": "Glassdoor / levels.fyi 2025" },
+  "jobPostings": [{ "company": "Stripe", "title": "...", "location": "Remote / SF" }],
+  "glassdoorData": [{ "company": "Stripe", "rating": 4.4, "reviewSnippets": ["..."] }],
   "positioningAdvice": {
-    "strengths": ["Acme-specific advantages a recruiter can talk to — equity upside at Series C, ownership of whole systems, faster promo cycles than Stripe/Coinbase"],
-    "watchouts": ["Risks specific to THIS role — e.g. if Stripe is hiring for same role right now, candidate likely has that option too"],
-    "talkingPoints": ["Concrete things to say on the recruiter call that differentiate Acme from the specific fintech competitors"],
-    "salaryPosition": "One sentence: where does Acme's total comp sit vs these fintech competitors for this role"
+    "strengths": ["Acme-specific advantages"],
+    "watchouts": ["Risks specific to this role"],
+    "talkingPoints": ["Concrete differentiators vs fintech competitors"],
+    "salaryPosition": "One sentence on where Acme total comp sits vs market"
   }
 }
 
-Be specific and realistic. Think fintech, not big tech. Salary in USD/year.`,
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          role,
-          competitors,
-          equivalentLevels: levels,
-          googleSearchResults: google.slice(0, 8),
-          linkedinData: linkedin.slice(0, 5),
-          githubSignals: github,
-        }),
-      },
-    ],
-    response_format: { type: "json_object" },
-  });
+Be specific and realistic. Fintech not big tech. Salary in USD/year.`,
+    { jsonMode: true }
+  );
 
-  const ai = JSON.parse(response.choices[0].message.content!);
+  const ai = JSON.parse(aiRaw);
 
   return {
     role,

@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { classifyQuestion, answerFromDocuments, generateEscalationRecommendation } from "@/lib/openai";
-import { getCommonDocuments, getCandidateDocuments, getFileContent } from "@/lib/box";
+import { classifyQuestion, generateEscalationRecommendation } from "@/lib/openai";
+import { getCommonDocuments, getCandidateDocuments, askBoxAI } from "@/lib/box";
 import { sendEscalationNotification } from "@/lib/resend";
+
+const READABLE = /\.(pdf|docx|doc|txt|md|csv)$/i;
 
 export async function POST(request: NextRequest) {
   const body = await request.json();
@@ -13,9 +15,7 @@ export async function POST(request: NextRequest) {
   }
 
   const candidate = await prisma.candidate.findUnique({ where: { id: candidateId } });
-  if (!candidate) {
-    return NextResponse.json({ error: "Candidate not found" }, { status: 404 });
-  }
+  if (!candidate) return NextResponse.json({ error: "Candidate not found" }, { status: 404 });
 
   // Get or create conversation
   let convId = conversationId;
@@ -24,20 +24,19 @@ export async function POST(request: NextRequest) {
     convId = conv.id;
   }
 
-  // Save user message
   const userMessage = await prisma.message.create({
     data: { conversationId: convId, role: "USER", content: question },
   });
 
-  // Track activity
   await prisma.candidateActivity.create({
     data: { candidateId, type: "QUESTION", description: question },
   });
 
   // Classify question
   const classification = await classifyQuestion(question);
-  console.log("[classify]", question, "→", classification.classification, classification.category, classification.documentScope);
+  console.log("[classify]", question, "→", classification.classification, classification.documentScope);
 
+  // RED — out of scope
   if (classification.classification === "RED") {
     const msg = await prisma.message.create({
       data: {
@@ -50,9 +49,9 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ message: msg, conversationId: convId, classification: "RED" });
   }
 
+  // YELLOW — escalate, no AI answer
   if (classification.classification === "YELLOW") {
     const aiRec = await generateEscalationRecommendation(question, classification.category);
-
     const msg = await prisma.message.create({
       data: {
         conversationId: convId,
@@ -61,88 +60,60 @@ export async function POST(request: NextRequest) {
         classification: "YELLOW",
       },
     });
-
     await prisma.escalation.create({
-      data: {
-        candidateId,
-        messageId: userMessage.id,
-        question,
-        category: classification.category,
-        priority: "MEDIUM",
-        aiRecommendation: aiRec,
-      },
+      data: { candidateId, messageId: userMessage.id, question, category: classification.category, priority: "MEDIUM", aiRecommendation: aiRec },
     });
-
     try {
       await sendEscalationNotification("hr@acme.com", candidate.name, candidateId, question, classification.category);
-    } catch {
-      console.error("Escalation notification failed");
-    }
+    } catch { console.error("Escalation notification failed"); }
 
     return NextResponse.json({ message: msg, conversationId: convId, classification: "YELLOW" });
   }
 
-  // GREEN — strict document retrieval based on classification scope
-  // common scope  → only company docs (no candidate data leakage)
-  // candidate scope → only this candidate's docs (no cross-candidate leakage)
-  // both scope → company docs + this candidate's docs only
-
-  type DocChunk = { fileId: string; fileName: string; content: string; source: "common" | "candidate" };
-  const docChunks: DocChunk[] = [];
-  const READABLE = /\.(pdf|docx|doc|txt|md|csv)$/i;
-
-  async function loadDocs(
-    docs: { id: string; name: string }[],
-    source: "common" | "candidate",
-    maxChars = 8000
-  ) {
-    for (const doc of docs.filter((d) => READABLE.test(d.name))) {
-      try {
-        const content = (await getFileContent(doc.id, doc.name)).trim();
-        if (content.length > 50) {
-          docChunks.push({ fileId: doc.id, fileName: doc.name, content: content.slice(0, maxChars), source });
-          console.log(`[rag] loaded ${source} doc: ${doc.name} (${content.length} chars)`);
-        }
-      } catch (e) {
-        console.error(`[rag] failed to read ${source} doc ${doc.name}:`, e);
-      }
-    }
-  }
+  // GREEN / GREEN_FLAG — answer via Box AI
+  // Strict scope: common | candidate | both — no cross-candidate leakage
+  const fileIds: string[] = [];
+  const fileNames: Record<string, string> = {};
 
   try {
     const scope = classification.documentScope;
 
     if (scope === "common" || scope === "both") {
-      const allCommon = await getCommonDocuments();
-      await loadDocs(allCommon as unknown as { id: string; name: string }[], "common");
+      const docs = (await getCommonDocuments()) as { id: string; name: string; type: string }[];
+      docs.filter((d) => READABLE.test(d.name)).forEach((d) => {
+        fileIds.push(d.id);
+        fileNames[d.id] = d.name;
+      });
     }
 
     if ((scope === "candidate" || scope === "both") && candidate.boxFolderId) {
-      // Strict: only load from THIS candidate's folder
-      const allCandidate = await getCandidateDocuments(candidate.boxFolderId);
-      await loadDocs(allCandidate as unknown as { id: string; name: string }[], "candidate", 6000);
+      const docs = (await getCandidateDocuments(candidate.boxFolderId)) as { id: string; name: string; type: string }[];
+      docs.filter((d) => READABLE.test(d.name)).forEach((d) => {
+        fileIds.push(d.id);
+        fileNames[d.id] = d.name;
+      });
     }
 
-    console.log(`[rag] scope=${scope} | loaded ${docChunks.length} docs (${docChunks.filter(d => d.source === "common").length} common, ${docChunks.filter(d => d.source === "candidate").length} candidate)`);
+    console.log(`[box-ai] scope=${scope} | files: [${Object.values(fileNames).join(", ")}]`);
   } catch (error) {
-    console.error("[rag] document retrieval error:", error);
+    console.error("[box-ai] file list error:", error);
   }
 
-  const result = await answerFromDocuments(question, docChunks);
+  // Ask Box AI
+  const result = await askBoxAI(question, fileIds, fileNames);
 
-  // If AI couldn't find the answer, auto-escalate to HR — candidate shouldn't be left hanging
+  // If Box AI couldn't answer, auto-escalate
   const couldNotAnswer =
-    result.confidence < 0.3 ||
+    fileIds.length === 0 ||
+    result.completionReason === "no_documents" ||
+    result.answer.toLowerCase().includes("i don't have") ||
+    result.answer.toLowerCase().includes("i do not have") ||
     result.answer.toLowerCase().includes("couldn't find") ||
-    result.answer.toLowerCase().includes("could not find") ||
-    result.answer.toLowerCase().includes("not found in the documents") ||
-    result.answer.toLowerCase().includes("confirm with hr") ||
-    result.answer.toLowerCase().includes("confirm this with");
+    result.answer.toLowerCase().includes("not available") ||
+    result.answer.trim().length < 20;
 
   if (couldNotAnswer) {
     const aiRec = await generateEscalationRecommendation(question, classification.category);
-
-    // Replace the "I don't know" message with an escalation message
     const msg = await prisma.message.create({
       data: {
         conversationId: convId,
@@ -151,7 +122,6 @@ export async function POST(request: NextRequest) {
         classification: "YELLOW",
       },
     });
-
     await prisma.escalation.create({
       data: {
         candidateId,
@@ -159,35 +129,33 @@ export async function POST(request: NextRequest) {
         question,
         category: classification.category,
         priority: "MEDIUM",
-        aiRecommendation: `AI could not answer from documents. ${aiRec}`,
+        aiRecommendation: `Box AI could not answer from documents. ${aiRec}`,
       },
     });
-
     try {
       await sendEscalationNotification("hr@acme.com", candidate.name, candidateId, question, classification.category);
-    } catch {
-      console.error("Escalation notification failed");
-    }
+    } catch { console.error("Escalation notification failed"); }
 
-    console.log(`[rag] auto-escalated unanswerable question: "${question}"`);
+    console.log(`[box-ai] auto-escalated unanswerable: "${question}"`);
     return NextResponse.json({ message: msg, conversationId: convId, classification: "YELLOW" });
   }
+
+  const isFlagged = classification.classification === "GREEN_FLAG";
+
+  const sources = result.sources.map((s) => ({ fileName: s.fileName, fileId: s.fileId }));
 
   const msg = await prisma.message.create({
     data: {
       conversationId: convId,
       role: "ASSISTANT",
       content: result.answer,
-      sources: result.sources,
-      confidence: result.confidence,
-      classification: classification.classification === "GREEN_FLAG" ? "GREEN_FLAG" : "GREEN",
+      sources,
+      confidence: 0.9, // Box AI doesn't return a confidence score
+      classification: isFlagged ? "GREEN_FLAG" : "GREEN",
     },
   });
 
-  const isFlagged = classification.classification === "GREEN_FLAG";
-
-  // GREEN_FLAG: answer was given, but also create a LOW-priority escalation
-  // so HR can see the candidate is asking concern-signal questions
+  // GREEN_FLAG: answered but create a low-priority concern signal for HR
   if (isFlagged) {
     const flagNote = classification.flagReason
       ? `Concern signal: ${classification.flagReason}`
@@ -203,19 +171,18 @@ export async function POST(request: NextRequest) {
         aiRecommendation: flagNote,
       },
     });
-
-    console.log(`[rag] GREEN_FLAG escalation created for "${question}"`);
+    console.log(`[box-ai] GREEN_FLAG escalation for "${question}"`);
   }
 
   await prisma.auditLog.create({
     data: {
       candidateId,
       question,
-      documentsUsed: docChunks.map((d) => d.fileName),
-      sourcesReturned: result.sources,
-      confidence: result.confidence,
+      documentsUsed: Object.values(fileNames),
+      sourcesReturned: sources,
+      confidence: 0.9,
       escalated: isFlagged,
-      classification: isFlagged ? "GREEN" : "GREEN",
+      classification: "GREEN",
     },
   });
 

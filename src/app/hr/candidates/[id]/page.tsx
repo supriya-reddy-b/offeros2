@@ -90,6 +90,13 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
   } | null>(null);
   const [healthLoading, setHealthLoading] = useState(false);
   const [candidateDocs, setCandidateDocs] = useState<{ id: string; boxFileId: string; fileName: string; docType: string; uploadedAt: string }[]>([]);
+  const [signingDocId, setSigningDocId] = useState<string | null>(null);
+  const [signResult, setSignResult] = useState<Record<string, string>>({}); // boxFileId → sign status
+  const [analysing, setAnalysing] = useState<string | null>(null);
+  const [docAnalysis, setDocAnalysis] = useState<Record<string, {
+    terms: Record<string, string>;
+    health: { score: number; status: string; missing: string[]; warnings: string[]; recommendation: string };
+  }>>({});
   const [docUploadLoading, setDocUploadLoading] = useState(false);
   const [selectedDocType, setSelectedDocType] = useState("OFFER_LETTER");
   const candidateFileRef = useRef<HTMLInputElement>(null);
@@ -136,6 +143,35 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
     } finally {
       setDocUploadLoading(false);
       if (candidateFileRef.current) candidateFileRef.current.value = "";
+    }
+  }
+
+  async function handleAnalyseDoc(boxFileId: string) {
+    setAnalysing(boxFileId);
+    try {
+      const res = await fetch(`/api/hr/candidates/${id}/documents/${boxFileId}/analyse`, { method: "POST" });
+      const data = await res.json();
+      setDocAnalysis((prev) => ({ ...prev, [boxFileId]: data }));
+    } finally {
+      setAnalysing(null);
+    }
+  }
+
+  async function handleSendForSignature(boxFileId: string) {
+    setSigningDocId(boxFileId);
+    try {
+      const res = await fetch(`/api/hr/candidates/${id}/sign`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileId: boxFileId }),
+      });
+      if (res.ok) {
+        setSignResult((prev) => ({ ...prev, [boxFileId]: "sent" }));
+      } else {
+        setSignResult((prev) => ({ ...prev, [boxFileId]: "error" }));
+      }
+    } finally {
+      setSigningDocId(null);
     }
   }
 
@@ -272,7 +308,8 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
               ) : (
                 <div className="space-y-2">
                   {candidateDocs.map((doc) => (
-                    <div key={doc.id} className="flex items-center gap-3 p-3 border border-gray-100 rounded-xl hover:bg-gray-50 transition-colors">
+                    <div key={doc.id} className="border border-gray-100 rounded-xl overflow-hidden">
+                    <div className="flex items-center gap-3 p-3 hover:bg-gray-50 transition-colors">
                       <div className="w-8 h-8 bg-indigo-100 rounded-lg flex items-center justify-center flex-shrink-0">
                         <svg className="w-4 h-4 text-indigo-600" fill="currentColor" viewBox="0 0 20 20">
                           <path fillRule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4z" clipRule="evenodd" />
@@ -282,11 +319,80 @@ export default function CandidateDetailPage({ params }: { params: Promise<{ id: 
                         <div className="text-sm font-medium text-gray-900 truncate">{doc.fileName}</div>
                         <div className="text-xs text-gray-400">{doc.docType.replace(/_/g, " ")} · {formatDate(doc.uploadedAt)}</div>
                       </div>
-                      <button onClick={() => handleDeleteCandidateDoc(doc.boxFileId)} className="text-gray-300 hover:text-red-500 transition-colors flex-shrink-0">
-                        <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                      </button>
+                      <div className="flex items-center gap-2 flex-shrink-0">
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          loading={analysing === doc.boxFileId}
+                          onClick={() => handleAnalyseDoc(doc.boxFileId)}
+                          className="text-xs text-gray-400 hover:text-indigo-600"
+                        >
+                          {docAnalysis[doc.boxFileId] ? "Re-analyse" : "Analyse"}
+                        </Button>
+                        {doc.docType === "OFFER_LETTER" && (
+                          signResult[doc.boxFileId] === "sent" ? (
+                            <span className="text-xs text-green-600 font-medium flex items-center gap-1">
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" /></svg>
+                              Sent for signature
+                            </span>
+                          ) : (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              loading={signingDocId === doc.boxFileId}
+                              onClick={() => handleSendForSignature(doc.boxFileId)}
+                              className="text-indigo-600 border-indigo-200 hover:bg-indigo-50"
+                            >
+                              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" /></svg>
+                              Send for Signature
+                            </Button>
+                          )
+                        )}
+                        <button onClick={() => handleDeleteCandidateDoc(doc.boxFileId)} className="text-gray-300 hover:text-red-500 transition-colors">
+                          <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                          </svg>
+                        </button>
+                      </div>
+                    </div>
+                    {/* Box AI Analysis Panel */}
+                    {docAnalysis[doc.boxFileId] && (
+                      <div className="mt-2 ml-11 space-y-3">
+                        {/* Health score */}
+                        <div className="flex items-center gap-3">
+                          <div className={`text-xs font-medium px-2 py-0.5 rounded-full ${
+                            docAnalysis[doc.boxFileId].health.status === "complete" ? "bg-green-100 text-green-700" :
+                            docAnalysis[doc.boxFileId].health.status === "incomplete" ? "bg-amber-100 text-amber-700" :
+                            "bg-red-100 text-red-700"
+                          }`}>
+                            Box AI · {docAnalysis[doc.boxFileId].health.score}/100
+                          </div>
+                          <span className="text-xs text-gray-500">{docAnalysis[doc.boxFileId].health.recommendation}</span>
+                        </div>
+
+                        {/* Missing fields */}
+                        {docAnalysis[doc.boxFileId].health.missing.length > 0 && (
+                          <div className="text-xs text-red-600 bg-red-50 rounded-lg px-3 py-2">
+                            <span className="font-medium">Missing: </span>
+                            {docAnalysis[doc.boxFileId].health.missing.join(", ")}
+                          </div>
+                        )}
+
+                        {/* Extracted terms */}
+                        {Object.keys(docAnalysis[doc.boxFileId].terms).filter(k => k !== "raw" && docAnalysis[doc.boxFileId].terms[k] && docAnalysis[doc.boxFileId].terms[k] !== "Not specified").length > 0 && (
+                          <div className="grid grid-cols-2 gap-1.5">
+                            {Object.entries(docAnalysis[doc.boxFileId].terms)
+                              .filter(([k, v]) => k !== "raw" && v && v !== "Not specified")
+                              .map(([key, value]) => (
+                                <div key={key} className="bg-gray-50 rounded-lg px-2.5 py-1.5">
+                                  <div className="text-xs text-gray-400 capitalize">{key.replace(/([A-Z])/g, " $1").trim()}</div>
+                                  <div className="text-xs font-medium text-gray-800 truncate">{value}</div>
+                                </div>
+                              ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     </div>
                   ))}
                 </div>

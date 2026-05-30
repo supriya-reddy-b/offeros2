@@ -1,12 +1,15 @@
-// Box client using Developer Token (runtime-refreshable)
+// Box client — developer token (runtime-refreshable)
 let runtimeToken: string = process.env.BOX_DEVELOPER_TOKEN ?? "";
 
 export function setBoxToken(token: string) {
   runtimeToken = token;
 }
 
+// ─── Core request helper ──────────────────────────────────────────────────────
+
 async function boxRequest(path: string, options: RequestInit = {}) {
-  const res = await fetch(`https://api.box.com/2.0${path}`, {
+  const base = path.startsWith("https://") ? path : `https://api.box.com/2.0${path}`;
+  const res = await fetch(base, {
     ...options,
     headers: {
       Authorization: `Bearer ${runtimeToken}`,
@@ -16,6 +19,8 @@ async function boxRequest(path: string, options: RequestInit = {}) {
   if (!res.ok) throw new Error(`Box ${path} → ${res.status}: ${await res.text()}`);
   return res;
 }
+
+// ─── Folder & file management ─────────────────────────────────────────────────
 
 export async function getCommonDocuments() {
   const folderId = process.env.BOX_COMMON_FOLDER_ID!;
@@ -31,7 +36,6 @@ export async function getCandidateDocuments(boxFolderId: string) {
 }
 
 export async function createCandidateFolder(candidateName: string, candidateId: string) {
-  // Always create under BOX_CANDIDATES_ROOT_ID — never under the common folder
   const parentId = process.env.BOX_CANDIDATES_ROOT_ID!;
   const res = await boxRequest("/folders", {
     method: "POST",
@@ -46,82 +50,17 @@ export async function createCandidateFolder(candidateName: string, candidateId: 
   return data.id as string;
 }
 
-// Upload to the common docs folder
 export async function uploadCommonFile(fileName: string, content: Buffer) {
-  const folderId = process.env.BOX_COMMON_FOLDER_ID!;
-  return uploadFile(folderId, fileName, content);
+  return uploadFile(process.env.BOX_COMMON_FOLDER_ID!, fileName, content);
 }
 
-// Upload to a specific candidate's folder — strict isolation
 export async function uploadCandidateFile(candidateBoxFolderId: string, fileName: string, content: Buffer) {
-  // Validate this is actually a candidate folder (must be under BOX_CANDIDATES_ROOT_ID)
   const folderInfo = await boxRequest(`/folders/${candidateBoxFolderId}`);
   const info = await folderInfo.json();
-  const parentId = info?.parent?.id;
-  if (parentId !== process.env.BOX_CANDIDATES_ROOT_ID) {
+  if (info?.parent?.id !== process.env.BOX_CANDIDATES_ROOT_ID) {
     throw new Error(`Security: folder ${candidateBoxFolderId} is not a candidate folder`);
   }
   return uploadFile(candidateBoxFolderId, fileName, content);
-}
-
-async function extractTextViaBoxRepresentation(fileId: string, fileName: string): Promise<string | null> {
-  try {
-    const infoRes = await boxRequest(`/files/${fileId}?fields=representations`, {
-      headers: { "X-Rep-Hints": "[extracted_text]" },
-    });
-    const info = await infoRes.json();
-    const entries: Array<{ representation: string; status: { state: string }; content: { url_template: string } }> =
-      info.representations?.entries ?? [];
-    const textRep = entries.find((e) => e.representation === "extracted_text");
-
-    if (!textRep || textRep.status.state === "none") return null;
-    if (textRep.status.state === "pending") await new Promise((r) => setTimeout(r, 3000));
-
-    const contentUrl = textRep.content.url_template.replace("{+asset_path}", "");
-    const textRes = await fetch(contentUrl, { headers: { Authorization: `Bearer ${runtimeToken}` } });
-    if (!textRes.ok) return null;
-
-    const text = await textRes.text();
-    if (text.trim().length > 50) {
-      console.log(`[box] extracted text via representation for ${fileName}: ${text.length} chars`);
-      return text;
-    }
-    return null;
-  } catch (e) {
-    console.warn(`[box] text representation failed for ${fileName}:`, e);
-    return null;
-  }
-}
-
-export async function getFileContent(fileId: string, fileName: string): Promise<string> {
-  const lowerName = fileName.toLowerCase();
-  const useBoxExtraction = lowerName.endsWith(".pdf") || lowerName.endsWith(".docx") || lowerName.endsWith(".doc");
-
-  if (useBoxExtraction) {
-    const text = await extractTextViaBoxRepresentation(fileId, fileName);
-    if (text) return text;
-  }
-
-  // Download raw content
-  const dlRes = await boxRequest(`/files/${fileId}/content`);
-  const buffer = Buffer.from(await dlRes.arrayBuffer());
-
-  if (lowerName.endsWith(".pdf")) {
-    const raw = buffer.toString("latin1");
-    const textMatches = raw.match(/\(([^)]{2,200})\)/g) ?? [];
-    const extracted = textMatches
-      .map((m) => m.slice(1, -1).replace(/\\n/g, "\n").replace(/\\t/g, " "))
-      .join(" ")
-      .replace(/\s+/g, " ")
-      .trim();
-    if (extracted.length > 100) {
-      console.log(`[box] fallback extract for ${fileName}: ${extracted.length} chars`);
-      return extracted;
-    }
-    return buffer.toString("utf-8").replace(/[^\x20-\x7E\n\r\t]/g, " ").replace(/\s+/g, " ").trim();
-  }
-
-  return buffer.toString("utf-8");
 }
 
 export async function uploadFile(folderId: string, fileName: string, content: Buffer) {
@@ -141,4 +80,160 @@ export async function uploadFile(folderId: string, fileName: string, content: Bu
 
 export async function deleteFile(fileId: string) {
   await boxRequest(`/files/${fileId}`, { method: "DELETE" });
+}
+
+// ─── Box AI ───────────────────────────────────────────────────────────────────
+// Uses Box's native AI to answer questions directly from stored files.
+// No text extraction, no chunking — Box handles it natively.
+
+export interface BoxAISource {
+  fileId: string;
+  fileName: string;
+  content?: string; // snippet Box returns in citations
+}
+
+export interface BoxAIResult {
+  answer: string;
+  sources: BoxAISource[];
+  completionReason: string;
+}
+
+export async function askBoxAI(
+  question: string,
+  fileIds: string[],
+  fileNames: Record<string, string> // fileId → fileName map
+): Promise<BoxAIResult> {
+  if (fileIds.length === 0) {
+    return {
+      answer: "No documents are available to answer this question.",
+      sources: [],
+      completionReason: "no_documents",
+    };
+  }
+
+  const res = await boxRequest("/ai/ask", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      mode: "multiple_item_qa",       // answer across multiple files
+      prompt: question,
+      items: fileIds.map((id) => ({ type: "file", id })),
+    }),
+  });
+
+  const data = await res.json();
+  console.log(`[box-ai] answered "${question.slice(0, 60)}..." from ${fileIds.length} files`);
+
+  const sources: BoxAISource[] = (data.citations ?? []).map(
+    (c: { id: string; content?: string }) => ({
+      fileId: c.id,
+      fileName: fileNames[c.id] ?? c.id,
+      content: c.content,
+    })
+  );
+
+  return {
+    answer: data.answer ?? "",
+    sources,
+    completionReason: data.completion_reason ?? "done",
+  };
+}
+
+// ─── Box Webhooks ─────────────────────────────────────────────────────────────
+// Register webhooks so Box calls us when files are added/deleted.
+// Avoids polling Box on every request.
+
+export interface BoxWebhook {
+  id: string;
+  target: { id: string; type: string };
+  address: string;
+  triggers: string[];
+}
+
+export async function listWebhooks(): Promise<BoxWebhook[]> {
+  const res = await boxRequest("/webhooks");
+  const data = await res.json();
+  return data.entries ?? [];
+}
+
+export async function registerWebhook(
+  folderId: string,
+  callbackUrl: string,
+  triggers = ["FILE.UPLOADED", "FILE.DELETED", "FILE.RENAMED", "FILE.RESTORED"]
+): Promise<BoxWebhook> {
+  const res = await boxRequest("/webhooks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      target: { id: folderId, type: "folder" },
+      address: callbackUrl,
+      triggers,
+    }),
+  });
+  return res.json();
+}
+
+export async function deleteWebhook(webhookId: string) {
+  await boxRequest(`/webhooks/${webhookId}`, { method: "DELETE" });
+}
+
+// ─── Box Sign ─────────────────────────────────────────────────────────────────
+// Send offer letters for e-signature directly from the candidate portal.
+// Signed document is stored back in Box automatically.
+
+export interface BoxSignRequest {
+  id: string;
+  status: string;
+  signFiles: { files: { id: string; name: string }[] };
+  signers: { email: string; status: string; signedAt?: string }[];
+  prepareUrl?: string; // HR can review before sending
+  signingLog?: { id: string };
+}
+
+export async function createSignRequest(params: {
+  signerEmail: string;
+  signerName: string;
+  fileId: string;           // offer letter file in Box
+  parentFolderId: string;   // where to store the signed copy
+  emailSubject?: string;
+  emailMessage?: string;
+  redirectUrl?: string;
+}): Promise<BoxSignRequest> {
+  const res = await boxRequest("/sign_requests", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      signers: [
+        {
+          email: params.signerEmail,
+          role: "signer",
+          name: params.signerName,
+        },
+      ],
+      source_files: [{ type: "file", id: params.fileId }],
+      parent_folder: { type: "folder", id: params.parentFolderId },
+      email_subject: params.emailSubject ?? "Please sign your offer letter",
+      email_message: params.emailMessage ?? "Your offer letter is ready for your signature. Please review and sign at your earliest convenience.",
+      ...(params.redirectUrl && { redirect_url: params.redirectUrl }),
+    }),
+  });
+
+  const data = await res.json();
+  console.log(`[box-sign] sign request created: ${data.id} for ${params.signerEmail}`);
+  return data;
+}
+
+export async function getSignRequest(signRequestId: string): Promise<BoxSignRequest> {
+  const res = await boxRequest(`/sign_requests/${signRequestId}`);
+  return res.json();
+}
+
+export async function cancelSignRequest(signRequestId: string) {
+  await boxRequest(`/sign_requests/${signRequestId}/cancel`, { method: "POST" });
+}
+
+export async function listSignRequests(): Promise<BoxSignRequest[]> {
+  const res = await boxRequest("/sign_requests");
+  const data = await res.json();
+  return data.entries ?? [];
 }

@@ -1,5 +1,5 @@
 import { ApifyClient } from "apify-client";
-import OpenAI from "openai";
+import { askClaude } from "./bedrock";
 
 const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 

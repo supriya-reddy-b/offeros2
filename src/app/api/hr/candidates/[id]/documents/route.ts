@@ -1,34 +1,29 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import { uploadCandidateFile, deleteFile, getCandidateDocuments } from "@/lib/box";
+import { extractOfferTerms, checkDocumentHealth, writeBoxMetadata } from "@/lib/box-ai";
 
-// GET — list candidate-specific docs (from Box + DB metadata)
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
 
   const candidate = await prisma.candidate.findUnique({ where: { id } });
   if (!candidate) return NextResponse.json({ error: "Not found" }, { status: 404 });
 
-  // Get tracked docs from DB
   const dbDocs = await prisma.candidateDocument.findMany({
     where: { candidateId: id },
     orderBy: { uploadedAt: "desc" },
   });
 
-  // Also list directly from Box in case anything was uploaded outside the portal
   let boxDocs: { id: string; name: string; size: number; created_at: string }[] = [];
   if (candidate.boxFolderId) {
     try {
       boxDocs = await getCandidateDocuments(candidate.boxFolderId) as unknown as typeof boxDocs;
-    } catch {
-      boxDocs = [];
-    }
+    } catch { boxDocs = []; }
   }
 
   return NextResponse.json({ dbDocs, boxDocs, boxFolderId: candidate.boxFolderId });
 }
 
-// POST — upload one or more candidate-specific docs
 export async function POST(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
 
@@ -49,7 +44,6 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       let buffer = Buffer.from(await file.arrayBuffer()) as Buffer;
       let fileName = file.name;
 
-      // Convert docx to PDF
       if (/\.docx?$/i.test(fileName)) {
         const { convertDocxToPdf } = await import("@/lib/docx-convert");
         const converted = await convertDocxToPdf(buffer, fileName);
@@ -57,10 +51,8 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
         fileName = converted.name;
       }
 
-      // Upload strictly to candidate's folder
       const uploaded = await uploadCandidateFile(candidate.boxFolderId!, fileName, buffer);
 
-      // Track in DB with doc type
       const dbDoc = await prisma.candidateDocument.create({
         data: {
           candidateId: id,
@@ -72,6 +64,11 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
       });
 
       results.push(dbDoc);
+
+      // Run Box AI processing async — don't block the upload response
+      processWithBoxAI(uploaded.id, docType, candidate.name, candidate.role, id, dbDoc.id)
+        .catch((e) => console.error("[box-ai] async processing failed:", e));
+
     } catch (err) {
       console.error(`Upload failed for ${file.name}:`, err);
     }
@@ -80,12 +77,76 @@ export async function POST(request: NextRequest, { params }: { params: Promise<{
   return NextResponse.json(results, { status: 201 });
 }
 
-// DELETE — remove a candidate-specific doc
+async function processWithBoxAI(
+  fileId: string,
+  docType: string,
+  candidateName: string,
+  role: string,
+  candidateId: string,
+  dbDocId: string
+) {
+  console.log(`[box-ai] processing ${docType} file ${fileId}`);
+
+  // Run extraction and health check in parallel
+  const [terms, health] = await Promise.allSettled([
+    docType === "OFFER_LETTER" || docType === "EQUITY_GRANT" || docType === "COMPENSATION_BREAKDOWN"
+      ? extractOfferTerms(fileId)
+      : Promise.resolve(null),
+    checkDocumentHealth(fileId, docType),
+  ]);
+
+  const extractedTerms = terms.status === "fulfilled" ? terms.value : null;
+  const healthResult = health.status === "fulfilled" ? health.value : null;
+
+  // Write metadata back to Box file
+  if (extractedTerms && healthResult) {
+    await writeBoxMetadata(fileId, extractedTerms, healthResult, docType);
+  }
+
+  // Store results in DB on the document record
+  if (extractedTerms || healthResult) {
+    await prisma.candidateDocument.update({
+      where: { id: dbDocId },
+      data: {
+        // Store AI analysis as JSON in a metadata field
+        // We'll add this column via migration below
+      },
+    }).catch(() => {}); // non-fatal if column doesn't exist yet
+  }
+
+  // Log as candidate activity so HR can see the AI processed it
+  if (healthResult) {
+    const statusMsg = healthResult.status === "complete"
+      ? `✓ Document complete (${healthResult.score}/100)`
+      : healthResult.missing.length > 0
+      ? `⚠ Missing: ${healthResult.missing.slice(0, 2).join(", ")}${healthResult.missing.length > 2 ? ` +${healthResult.missing.length - 2} more` : ""}`
+      : `Document processed (${healthResult.score}/100)`;
+
+    await prisma.candidateActivity.create({
+      data: {
+        candidateId,
+        type: "DOCUMENT_PROCESSED",
+        description: `Box AI analysed ${docType.replace(/_/g, " ")}: ${statusMsg}`,
+        metadata: JSON.parse(JSON.stringify({
+          fileId,
+          docType,
+          healthScore: healthResult.score,
+          healthStatus: healthResult.status,
+          missing: healthResult.missing,
+          warnings: healthResult.warnings,
+          extractedTerms: extractedTerms ?? {},
+        })),
+      },
+    });
+  }
+
+  console.log(`[box-ai] finished processing ${fileId} — health: ${healthResult?.status ?? "unknown"}`);
+}
+
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   const { id } = await params;
   const { boxFileId } = await request.json();
 
-  // Verify this file belongs to this candidate before deleting
   const doc = await prisma.candidateDocument.findFirst({
     where: { candidateId: id, boxFileId },
   });
