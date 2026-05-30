@@ -24,14 +24,14 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
     role: candidate.role,
     status: candidate.status,
     daysSinceOffer,
-    escalations: candidate.escalations.map((e) => ({
+    escalations: candidate.escalations.map((e: { question: string; category: string; priority: string; status: string; createdAt: Date }) => ({
       question: e.question,
       category: e.category,
       priority: e.priority,
       status: e.status,
       createdAt: e.createdAt.toISOString(),
     })),
-    activities: candidate.activities.map((a) => ({
+    activities: candidate.activities.map((a: { type: string; description: string; createdAt: Date }) => ({
       type: a.type,
       description: a.description,
       createdAt: a.createdAt.toISOString(),
