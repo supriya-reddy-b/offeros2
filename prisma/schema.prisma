@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Candidate {
+  id                String               @id @default(cuid())
+  name              String
+  email             String               @unique
+  role              String
+  status            CandidateStatus      @default(INVITED)
+  boxFolderId       String?
+  magicToken        String?              @unique
+  magicTokenExpiry  DateTime?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  conversations     Conversation[]
+  escalations       Escalation[]
+  activities        CandidateActivity[]
+  intelligence      CandidateIntelligence?
+  auditLogs         AuditLog[]
+}
+
+model Conversation {
+  id          String    @id @default(cuid())
+  candidateId String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  candidate   Candidate @relation(fields: [candidateId], references: [id])
+  messages    Message[]
+}
+
+model Message {
+  id             String      @id @default(cuid())
+  conversationId String
+  role           MessageRole
+  content        String      @db.Text
+  sources        Json?
+  confidence     Float?
+  classification MessageClass?
+  createdAt      DateTime    @default(now())
+
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  escalation     Escalation?
+}
+
+model Escalation {
+  id               String             @id @default(cuid())
+  candidateId      String
+  messageId        String?            @unique
+  question         String             @db.Text
+  category         String
+  priority         EscalationPriority @default(MEDIUM)
+  status           EscalationStatus   @default(OPEN)
+  aiRecommendation String?            @db.Text
+  hrResponse       String?            @db.Text
+  respondedAt      DateTime?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  candidate        Candidate          @relation(fields: [candidateId], references: [id])
+  message          Message?           @relation(fields: [messageId], references: [id])
+}
+
+model CandidateActivity {
+  id          String   @id @default(cuid())
+  candidateId String
+  type        String
+  description String
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  candidate   Candidate @relation(fields: [candidateId], references: [id])
+}
+
+model CandidateIntelligence {
+  id                    String   @id @default(cuid())
+  candidateId           String   @unique
+  interests             Json?
+  recentActivity        Json?
+  suggestedTalkingPoints Json?
+  githubData            Json?
+  linkedinData          Json?
+  rawData               Json?
+  generatedAt           DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+
+  candidate             Candidate @relation(fields: [candidateId], references: [id])
+}
+
+model AuditLog {
+  id              String   @id @default(cuid())
+  candidateId     String
+  question        String   @db.Text
+  documentsUsed   Json
+  sourcesReturned Json
+  confidence      Float?
+  escalated       Boolean  @default(false)
+  classification  String?
+  createdAt       DateTime @default(now())
+
+  candidate       Candidate @relation(fields: [candidateId], references: [id])
+}
+
+enum CandidateStatus {
+  INVITED
+  ACTIVE
+  NEGOTIATING
+  ACCEPTED
+  DECLINED
+}
+
+enum MessageRole {
+  USER
+  ASSISTANT
+}
+
+enum MessageClass {
+  GREEN
+  YELLOW
+  RED
+}
+
+enum EscalationPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum EscalationStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
