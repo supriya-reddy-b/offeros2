@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getCommonDocuments, uploadFile, deleteFile } from "@/lib/box";
+import { getCommonDocuments, uploadCommonFile, deleteFile } from "@/lib/box";
+import { convertDocxToPdf } from "@/lib/docx-convert";
 
 export async function GET() {
   try {
@@ -13,23 +14,33 @@ export async function GET() {
 
 export async function POST(request: NextRequest) {
   const formData = await request.formData();
-  const file = formData.get("file") as File;
-  const folderId = formData.get("folderId") as string | null;
+  const files = formData.getAll("file") as File[];
 
-  if (!file) {
-    return NextResponse.json({ error: "No file provided" }, { status: 400 });
+  if (!files || files.length === 0) {
+    return NextResponse.json({ error: "No files provided" }, { status: 400 });
   }
 
-  const buffer = Buffer.from(await file.arrayBuffer());
-  const targetFolder = folderId || process.env.BOX_COMMON_FOLDER_ID || "0";
+  const results = [];
 
-  try {
-    const uploaded = await uploadFile(targetFolder, file.name, buffer);
-    return NextResponse.json(uploaded, { status: 201 });
-  } catch (error) {
-    console.error("Upload error:", error);
-    return NextResponse.json({ error: "Upload failed" }, { status: 500 });
+  for (const file of files) {
+    try {
+      let buffer = Buffer.from(await file.arrayBuffer()) as Buffer;
+      let fileName = file.name;
+
+      if (/\.docx?$/i.test(fileName)) {
+        const converted = await convertDocxToPdf(buffer, fileName);
+        buffer = converted.buffer;
+        fileName = converted.name;
+      }
+
+      const uploaded = await uploadCommonFile(fileName, buffer);
+      results.push(uploaded);
+    } catch (error) {
+      console.error(`Upload error for ${file.name}:`, error);
+    }
   }
+
+  return NextResponse.json(results, { status: 201 });
 }
 
 export async function DELETE(request: NextRequest) {

@@ -6,6 +6,12 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
   const { id } = await params;
   const body = await request.json();
 
+  // Check if already responded — prevent duplicate messages on double-submit
+  const existing = await prisma.escalation.findUnique({ where: { id } });
+  if (existing?.hrResponse && body.hrResponse) {
+    return NextResponse.json({ error: "Already responded" }, { status: 409 });
+  }
+
   const escalation = await prisma.escalation.update({
     where: { id },
     data: {

@@ -9,13 +9,14 @@ function getOpenAI(): OpenAI {
   return _client;
 }
 
-export type QuestionClass = "GREEN" | "YELLOW" | "RED";
+export type QuestionClass = "GREEN" | "GREEN_FLAG" | "YELLOW" | "RED";
 
 export interface ClassificationResult {
   classification: QuestionClass;
   category: string;
   documentScope: "common" | "candidate" | "both";
   reasoning: string;
+  flagReason?: string; // only set for GREEN_FLAG — why this needs HR visibility
 }
 
 export async function classifyQuestion(question: string): Promise<ClassificationResult> {
@@ -25,32 +26,57 @@ export async function classifyQuestion(question: string): Promise<Classification
     messages: [
       {
         role: "system",
-        content: `You are a question classifier for a job offer portal. Classify candidate questions into:
+        content: `You are a question classifier for a job offer portal. Classify candidate questions into one of four categories:
 
-GREEN: AI can answer by reading documents. This includes:
-- Reading/asking WHAT their offer says (start date, salary, bonus, equity grant, title, role details)
-- General company policies: PTO, benefits, health insurance, 401k, equity vesting schedule, career framework, remote work
-- How things work: how vesting works, what RSUs are, how the bonus is calculated
-- Any factual question that can be answered by looking at offer documents
+GREEN: AI answers from documents. No HR notification needed.
+- What their offer says (start date, salary, bonus, equity, title)
+- Standard company policies: PTO, benefits, health insurance, 401k, vesting, remote work
+- How things work: how RSUs vest, what the bonus structure is
+- Meta questions: "what documents do you have", "what can you help me with"
 
-YELLOW: Requires human HR review. ONLY use this for:
-- Requests to CHANGE or NEGOTIATE something (e.g. "can you increase my salary", "I want more equity", "can we move my start date")
+GREEN_FLAG: AI answers from documents, BUT also creates a low-priority HR alert.
+Use this when the question itself signals candidate anxiety, doubt, or comparison shopping — even if it's factually answerable.
+Examples of concern-signal questions:
+- PIP / performance improvement plan policy → signals job security fear
+- Attrition rate / employee turnover → signals doubt about company stability
+- Layoff history or policy → signals fear of job loss
+- Why did the last person in this role leave? → red flag question
+- How long do people typically stay in this role? → retention concern
+- What happens to my equity if the company is acquired? → exit scenario planning
+- Non-compete / non-solicitation clauses → lawyer-mode thinking
+- Clawback policy / repayment clauses → distrust signal
+- How often do people get promoted here? → comparison shopping
+- Is this role likely to be outsourced or automated? → existential concern
+The candidate deserves an answer, but HR should know they're asking.
+
+YELLOW: Human HR review only. AI does NOT answer.
+- Requests to CHANGE or NEGOTIATE: "can you increase my salary", "I want more equity", "move my start date"
 - Requests for exceptions or special treatment
-- Questions HR must personally decide (not just read from a doc)
+- Questions only HR can personally decide
 
-RED: Out of scope entirely. Examples: politics, sports, general knowledge, anything unrelated to employment.
+RED: Completely out of scope.
+- Politics, sports, general knowledge, anything unrelated to employment
 
-KEY RULE: Asking WHAT something is = GREEN. Asking to CHANGE something = YELLOW.
-Also GREEN: meta questions like "what documents do you have", "what can you help me with", "what information is available".
-"What is my salary?" → GREEN. "Can you increase my salary?" → YELLOW.
-"What is my start date?" → GREEN. "Can we change my start date?" → YELLOW.
+KEY RULES:
+- Asking WHAT = GREEN (or GREEN_FLAG if it's a concern signal)
+- Asking to CHANGE = YELLOW
+- "What is my salary?" → GREEN. "Can you increase my salary?" → YELLOW.
+- "What's the PIP policy?" → GREEN_FLAG (answerable + signals anxiety)
+- "What's the attrition rate?" → GREEN_FLAG (answerable + signals doubt)
 
-Also determine documentScope:
-- "common": general company policy question (benefits, PTO, equity policy, career framework)
-- "candidate": specific to this candidate's offer (their salary, their start date, their equity grant)
-- "both": could need both
+documentScope:
+- "common": general company policy
+- "candidate": specific to this candidate's offer
+- "both": needs both
 
-Respond with JSON only: { "classification": "GREEN"|"YELLOW"|"RED", "category": "string describing the topic", "documentScope": "common"|"candidate"|"both", "reasoning": "brief explanation" }`,
+Respond with JSON only:
+{
+  "classification": "GREEN"|"GREEN_FLAG"|"YELLOW"|"RED",
+  "category": "topic label",
+  "documentScope": "common"|"candidate"|"both",
+  "reasoning": "brief explanation",
+  "flagReason": "only for GREEN_FLAG — one sentence on why HR should see this"
+}`,
       },
       { role: "user", content: question },
     ],

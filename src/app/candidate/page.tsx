@@ -68,10 +68,9 @@ function CandidatePortal() {
   async function loadMessages(candidateId: string) {
     const res = await fetch(`/api/candidate/messages?candidateId=${candidateId}`);
     const data = await res.json();
-    if (data.messages?.length > 0) {
-      setMessages(data.messages);
-      if (data.conversationId) setConversationId(data.conversationId);
-    }
+    if (data.conversationId) setConversationId(data.conversationId);
+    // Always replace from DB — single source of truth, no duplicates
+    setMessages(data.messages ?? []);
   }
 
   async function fetchDocuments(boxFolderId: string | null) {
@@ -107,9 +106,8 @@ function CandidatePortal() {
       });
       const data = await res.json();
       if (data.conversationId) setConversationId(data.conversationId);
-      if (data.message) {
-        setMessages((prev) => [...prev, { ...data.message, id: data.message.id || Date.now().toString() }]);
-      }
+      // Reload from DB so we always have the canonical list — no duplicates
+      if (session) await loadMessages(session.id);
     } catch {
       setMessages((prev) => [...prev, {
         id: Date.now().toString(),

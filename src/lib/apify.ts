@@ -1,7 +1,7 @@
 import { ApifyClient } from "apify-client";
 import OpenAI from "openai";
 
-const client = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
+const apify = new ApifyClient({ token: process.env.APIFY_API_TOKEN });
 
 export interface CandidateIntelligenceData {
   interests: string[];
@@ -9,98 +9,188 @@ export interface CandidateIntelligenceData {
   suggestedTalkingPoints: string[];
   githubData: {
     active: boolean;
+    username: string;
     recentCommits?: number;
     topLanguages?: string[];
     recentRepos?: string[];
+    followers?: number;
+    bio?: string;
   } | null;
   linkedinData: {
-    recentUpdates?: string[];
     headline?: string;
+    summary?: string;
+    currentCompany?: string;
+    skills?: string[];
+    recentUpdates?: string[];
   } | null;
 }
 
-async function scrapeGitHub(username: string) {
-  try {
-    const run = await client.actor("apify/github-scraper").call({
-      startUrls: [{ url: `https://github.com/${username}` }],
-      maxDepth: 1,
-    });
-    const { items } = await client.dataset(run.defaultDatasetId).listItems();
-    return items[0] || null;
-  } catch {
-    return null;
+// ─── GitHub via public REST API (no scraping needed) ──────────────────────────
+async function fetchGitHub(candidateName: string, email: string): Promise<object | null> {
+  const emailUser = email.split("@")[0];
+  const nameParts = candidateName.toLowerCase().replace(/\s+/g, "");
+
+  // Try email username first, then name-based guess
+  const usernamesToTry = [emailUser, nameParts, candidateName.toLowerCase().replace(/\s+/g, "-")];
+
+  for (const username of usernamesToTry) {
+    try {
+      const res = await fetch(`https://api.github.com/users/${username}`, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "OfferOS" },
+      });
+      if (!res.ok) continue;
+
+      const user = await res.json();
+
+      // Get recent repos
+      const reposRes = await fetch(`https://api.github.com/users/${username}/repos?sort=updated&per_page=6`, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "OfferOS" },
+      });
+      const repos = reposRes.ok ? await reposRes.json() : [];
+
+      // Get recent events (commits etc)
+      const eventsRes = await fetch(`https://api.github.com/users/${username}/events/public?per_page=10`, {
+        headers: { Accept: "application/vnd.github+json", "User-Agent": "OfferOS" },
+      });
+      const events = eventsRes.ok ? await eventsRes.json() : [];
+      const pushEvents = events.filter((e: { type: string }) => e.type === "PushEvent");
+      const recentCommits = pushEvents.reduce(
+        (sum: number, e: { payload: { commits: unknown[] } }) => sum + (e.payload?.commits?.length ?? 0),
+        0
+      );
+
+      // Top languages from repos
+      const langs: Record<string, number> = {};
+      for (const repo of repos.slice(0, 6)) {
+        if (repo.language) langs[repo.language] = (langs[repo.language] || 0) + 1;
+      }
+      const topLanguages = Object.entries(langs)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([l]) => l);
+
+      console.log(`[apify] GitHub found for ${username}: ${user.public_repos} repos, ${recentCommits} recent commits`);
+
+      return {
+        username,
+        name: user.name,
+        bio: user.bio,
+        company: user.company,
+        followers: user.followers,
+        publicRepos: user.public_repos,
+        recentCommits,
+        topLanguages,
+        recentRepos: repos.slice(0, 5).map((r: { name: string; description: string; stargazers_count: number }) => ({
+          name: r.name,
+          description: r.description,
+          stars: r.stargazers_count,
+        })),
+      };
+    } catch {
+      continue;
+    }
   }
+
+  console.log(`[apify] GitHub not found for ${candidateName}`);
+  return null;
 }
 
-async function scrapeLinkedIn(linkedinUrl: string) {
+// ─── LinkedIn via Apify ───────────────────────────────────────────────────────
+async function fetchLinkedIn(candidateName: string): Promise<object | null> {
+  const nameParts = candidateName.toLowerCase().split(" ");
+  const slug = nameParts.join("-");
+
   try {
-    const run = await client.actor("apify/linkedin-profile-scraper").call({
-      profileUrls: [linkedinUrl],
-    });
-    const { items } = await client.dataset(run.defaultDatasetId).listItems();
-    return items[0] || null;
-  } catch {
-    return null;
+    const run = await apify.actor("2SyF0bVxmgGr8IVCZ").call({
+      profileUrls: [`https://www.linkedin.com/in/${slug}/`],
+      proxy: { useApifyProxy: true },
+    }, { waitSecs: 60 });
+
+    const { items } = await apify.dataset(run.defaultDatasetId).listItems();
+    if (items.length > 0) {
+      console.log(`[apify] LinkedIn found for ${candidateName}`);
+      return items[0];
+    }
+  } catch (e) {
+    console.warn(`[apify] LinkedIn scrape failed:`, e);
   }
+
+  return null;
 }
 
+// ─── Main export ──────────────────────────────────────────────────────────────
 export async function collectCandidateIntelligence(
   candidateName: string,
   candidateEmail: string
 ): Promise<CandidateIntelligenceData> {
-  const emailUser = candidateEmail.split("@")[0];
-  const nameParts = candidateName.toLowerCase().split(" ");
+  console.log(`[apify] collecting intelligence for ${candidateName} (${candidateEmail})`);
 
   const [githubRaw, linkedinRaw] = await Promise.allSettled([
-    scrapeGitHub(emailUser),
-    scrapeLinkedIn(`https://www.linkedin.com/in/${nameParts.join("-")}`),
+    fetchGitHub(candidateName, candidateEmail),
+    fetchLinkedIn(candidateName),
   ]);
 
   const github = githubRaw.status === "fulfilled" ? githubRaw.value : null;
   const linkedin = linkedinRaw.status === "fulfilled" ? linkedinRaw.value : null;
 
-  const signals = JSON.stringify({ github, linkedin, candidateName });
+  console.log(`[apify] github: ${github ? "✓" : "✗"}, linkedin: ${linkedin ? "✓" : "✗"}`);
 
-  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-  const response = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content: `Analyze candidate public signals and extract:
-1. interests (array of 3-6 topics/areas they seem interested in)
-2. recentActivity (array of 2-4 recent notable public activities)
-3. suggestedTalkingPoints (array of 3-5 specific talking points for a recruiter call)
+  // Only surface what was actually scraped — no AI fabrication
+  const githubTyped = github as {
+    username?: string;
+    recentCommits?: number;
+    topLanguages?: string[];
+    recentRepos?: { name: string; description?: string; stars?: number }[];
+    followers?: number;
+    bio?: string;
+    publicRepos?: number;
+  } | null;
 
-If data is sparse, make reasonable inferences from what's available. Always return valid arrays.
+  const linkedinTyped = linkedin as {
+    headline?: string;
+    summary?: string;
+    positions?: { companyName?: string }[];
+    skills?: string[];
+    activity?: string[];
+  } | null;
 
-Respond with JSON: { "interests": [], "recentActivity": [], "suggestedTalkingPoints": [] }`,
-      },
-      { role: "user", content: signals },
-    ],
-    response_format: { type: "json_object" },
-  });
-
-  const ai = JSON.parse(response.choices[0].message.content!);
+  // Build recentActivity only from real scraped signals — empty if nothing found
+  const recentActivity: string[] = [];
+  if (githubTyped?.recentCommits && githubTyped.recentCommits > 0) {
+    recentActivity.push(`Pushed ${githubTyped.recentCommits} commits in the last 30 days on GitHub`);
+  }
+  if (githubTyped?.recentRepos?.length) {
+    const top = githubTyped.recentRepos[0];
+    recentActivity.push(`Recently active on: ${top.name}${top.description ? ` — ${top.description}` : ""}`);
+  }
+  if (linkedinTyped?.activity?.length) {
+    (linkedinTyped.activity as string[]).slice(0, 2).forEach(a => recentActivity.push(a));
+  }
 
   return {
-    interests: ai.interests || [],
-    recentActivity: ai.recentActivity || [],
-    suggestedTalkingPoints: ai.suggestedTalkingPoints || [],
-    githubData: github
+    interests: [],           // not fabricated — left for future real data source
+    recentActivity,          // only real signals
+    suggestedTalkingPoints: [], // removed — not shown in UI
+    githubData: githubTyped
       ? {
-          active: true,
-          recentCommits: typeof github.recentCommitsCount === "number" ? github.recentCommitsCount : undefined,
-          topLanguages: Array.isArray(github.topLanguages) ? (github.topLanguages as string[]) : undefined,
-          recentRepos: Array.isArray(github.recentRepos)
-            ? (github.recentRepos as { name: string }[]).map((r) => r.name)
-            : undefined,
+          active: (githubTyped.recentCommits ?? 0) > 0,
+          username: githubTyped.username ?? "",
+          recentCommits: githubTyped.recentCommits,
+          topLanguages: githubTyped.topLanguages,
+          recentRepos: githubTyped.recentRepos?.map((r) => r.name),
+          followers: githubTyped.followers,
+          bio: githubTyped.bio ?? undefined,
         }
       : null,
-    linkedinData: linkedin
+    linkedinData: linkedinTyped
       ? {
-          headline: typeof linkedin.headline === "string" ? linkedin.headline : undefined,
-          recentUpdates: Array.isArray(linkedin.recentActivity) ? (linkedin.recentActivity as string[]) : undefined,
+          headline: linkedinTyped.headline,
+          summary: linkedinTyped.summary,
+          currentCompany: linkedinTyped.positions?.[0]?.companyName,
+          skills: linkedinTyped.skills?.slice(0, 10),
+          recentUpdates: Array.isArray(linkedinTyped.activity)
+            ? (linkedinTyped.activity as string[]).slice(0, 3)
+            : undefined,
         }
       : null,
   };
