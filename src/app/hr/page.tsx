@@ -84,16 +84,21 @@ export default function HRDashboard() {
   }
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files ?? []);
+    if (files.length === 0) return;
     setUploadLoading(true);
-    const formData = new FormData();
-    formData.append("file", file);
     try {
-      await fetch("/api/hr/documents", { method: "POST", body: formData });
+      await Promise.all(
+        files.map((file) => {
+          const formData = new FormData();
+          formData.append("file", file);
+          return fetch("/api/hr/documents", { method: "POST", body: formData });
+        })
+      );
       fetchDocuments();
     } finally {
       setUploadLoading(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
     }
   }
 
@@ -137,7 +142,7 @@ export default function HRDashboard() {
               </div>
             </div>
             <div className="flex gap-2">
-              <input ref={fileInputRef} type="file" className="hidden" onChange={handleUpload} accept=".pdf,.doc,.docx" />
+              <input ref={fileInputRef} type="file" className="hidden" onChange={handleUpload} accept=".pdf,.doc,.docx" multiple />
               <Button variant="outline" size="sm" onClick={() => fileInputRef.current?.click()} loading={uploadLoading}>
                 <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
